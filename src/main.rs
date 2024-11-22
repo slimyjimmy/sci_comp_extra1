@@ -1,33 +1,88 @@
 // Djimon Nowak
 
 use clap::Parser;
-use memchr::memchr;
+use ordered_float::NotNan;
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
-
-const READ_BUF_SIZE: usize = 128 * 1024; // 128 KiB
+use std::time::Instant;
+use rustc_hash::FxHashMap;
+use memmap2::Mmap;
+use memchr::memchr;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sci_comp_extra1",
-    version = "1.3",
-    about = "10 times the one billion row challenge with a twist"
+    version = "1.0",
+    about = "Scientific Computing exercise extra 1"
 )]
 struct Args {
+    #[arg(short = 'f', long, help = "Path to the measurement file")]
     file: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct StationValues {
     min: f64,
     max: f64,
-    mean: f64,
-    count: u32,
+    frequency: HashMap<NotNan<f64>, u64>,
+    count: u64,
 }
 
-fn process_chunk(data: &[u8], result: &mut HashMap<Box<[u8]>, StationValues>) {
-    let mut buffer = &data[..];
+impl StationValues {
+    fn new() -> Self {
+        StationValues {
+            min: 0.0,
+            max: 0.0,
+            count: 0,
+            frequency: (-999..=999)
+            .map(|x| (NotNan::new(round_off(x as f64 * 0.1)).unwrap(), 0)) // Convert to f64 and pair with 0
+            .collect()
+        }
+    }
 
+    fn new_with_value(value: f64) -> Self {
+        let mut station_values = StationValues::new();
+        station_values.min = value;
+        station_values.max = value;
+        *station_values.frequency.get_mut(&NotNan::new(value).expect("Value is NaN")).unwrap_or_else(|| panic!("Get mut failed with {}", value)) += 1;
+        station_values.count = 1;
+        station_values
+    }
+
+    // get 0-indexed value by index
+    fn get_nth_value(&self, n: u64) -> f64 {
+        let mut cur = 0;
+
+        let keys: Vec<NotNan<f64>> = (-999..=999)
+        .map(|x| NotNan::new(round_off(x as f64 * 0.1)).unwrap())
+        .collect();
+
+        for key in keys {
+            let count = self.frequency[&key];
+            if n < cur + count {
+                return key.into_inner();
+            }
+            cur += count;
+        }
+
+        0.0
+    }
+
+    fn get_median(&self) -> f64 {
+        if self.count % 2 == 0 {
+            // even number of values -> return 1/2(left-middle + right-middle)
+            let left_mid_index = (self.count / 2) - 1;
+            (self.get_nth_value(left_mid_index) + self.get_nth_value(left_mid_index + 1)) / 2.0
+        } else {
+            // odd number of values -> return middle
+            self.get_nth_value(self.count / 2)
+        }
+    }
+}
+
+// Calculate the station values
+fn calculate_station_values(data:&[u8]) -> FxHashMap<&[u8], StationValues> {
+    let mut result: FxHashMap<&[u8], StationValues> = FxHashMap::default();
+    let  mut buffer = data;
     loop {
         match memchr(b';', buffer) {
             None => {
@@ -36,11 +91,11 @@ fn process_chunk(data: &[u8], result: &mut HashMap<Box<[u8]>, StationValues>) {
             Some(comma_seperator) => {
                 let end = memchr(b'\n', &buffer[comma_seperator..]).unwrap();
                 let name = &buffer[..comma_seperator];
-                let value = &buffer[comma_seperator + 1..comma_seperator + end];
-                let value: f64 = fast_float::parse(value).expect("Failed to parse value");
+                let value = &buffer[comma_seperator+1..comma_seperator+end];
+                let value = fast_float::parse(value).expect("Failed to parse value");
 
                 result
-                    .entry(name.into())
+                    .entry(name)
                     .and_modify(|e| {
                         if value < e.min {
                             e.min = value;
@@ -48,30 +103,33 @@ fn process_chunk(data: &[u8], result: &mut HashMap<Box<[u8]>, StationValues>) {
                         if value > e.max {
                             e.max = value;
                         }
-                        e.mean += value;
+                        *e.frequency.get_mut(&NotNan::new(value).unwrap()).unwrap() += 1;
                         e.count += 1;
                     })
-                    .or_insert(StationValues {
-                        min: value,
-                        max: value,
-                        mean: value,
-                        count: 1,
-                    });
-                buffer = &buffer[comma_seperator + end + 1..];
+                    .or_insert(StationValues::new_with_value(value));
+                buffer = &buffer[comma_seperator+end+1..];
             }
+
         }
     }
 
-    // result
+
+    // Calculate the mean for all entries and round off to 1 decimal place
+    for (_, station_values) in result.iter_mut() {
+        station_values.min = round_off(station_values.min);
+        station_values.max = round_off(station_values.max);
+    }
+
+    result
 }
 
-pub fn round_off(value: f64) -> f64 {
+fn round_off(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
-fn write_result_stdout(mut result: HashMap<Box<[u8]>, StationValues>) {
+fn write_result_stdout(result: FxHashMap<&[u8], StationValues>) {
     let mut ordered_result = BTreeMap::new();
-    for (station_name, station_values) in result.iter_mut() {
+    for (station_name, station_values) in result {
         ordered_result.insert(station_name, station_values);
     }
     let mut iterator = ordered_result.iter().peekable();
@@ -80,123 +138,28 @@ fn write_result_stdout(mut result: HashMap<Box<[u8]>, StationValues>) {
         if iterator.peek().is_none() {
             print!(
                 "{}={:.1}/{:.1}/{:.1}}}",
-                std::str::from_utf8(station_name)
-                    .expect("Can't parse station name as UTF-8 string"),
-                station_values.min,
-                station_values.mean,
-                station_values.max
+                std::str::from_utf8(station_name).expect("Unable to validate station name as UTF-8"), station_values.min, station_values.get_median(), station_values.max
             );
         } else {
             print!(
                 "{}={:.1}/{:.1}/{:.1}, ",
-                std::str::from_utf8(station_name)
-                    .expect("Can't parse station name as UTF-8 string"),
-                station_values.min,
-                station_values.mean,
-                station_values.max
+                std::str::from_utf8(station_name).expect("Unable to validate station name as UTF-8"), station_values.min, station_values.get_median(), station_values.max
             );
         }
     }
 }
 
-fn calculate_station_values(mut file: std::fs::File) -> HashMap<Box<[u8]>, StationValues> {
-    // Start the processor threads
-    let (sender, receiver) = crossbeam_channel::bounded::<Box<[u8]>>(1_000);
-    let n_threads = std::thread::available_parallelism().unwrap().into();
-    let mut handles = Vec::with_capacity(n_threads);
-    for _ in 0..n_threads {
-        let receiver = receiver.clone();
-        let handle = std::thread::spawn(move || {
-            let mut result = HashMap::<Box<[u8]>, StationValues>::default();
-            // wait until the sender sends the chunk
-            for buf in receiver {
-                process_chunk(&buf, &mut result);
-            }
-            result
-        });
-        handles.push(handle);
-    }
-
-    // Read the file in chunks and send the chunks to the processor threads
-    let mut buf = vec![0; READ_BUF_SIZE];
-    let mut bytes_not_processed = 0;
-    loop {
-        let bytes_read = file.read(&mut buf[bytes_not_processed..]).expect("Failed to read file");
-        if bytes_read == 0 {
-            break;
-        }
-
-        let actual_buf = &mut buf[..bytes_not_processed+bytes_read];
-        let last_new_line_index = match find_new_line_pos(actual_buf) {
-            Some(index) => index,
-            None => {
-                println!("No new line found in the read buffer");
-                bytes_not_processed += bytes_read;
-                if bytes_not_processed == buf.len(){
-                    panic!("No new line found in the read buffer");
-                }
-                continue; // try again, maybe we next read will have a newline
-            }
-        };
-
-        let buf_boxed = Box::<[u8]>::from(&actual_buf[..(last_new_line_index + 1)]);
-        sender.send(buf_boxed).expect("Failed to send buffer");
-
-        actual_buf.copy_within(last_new_line_index+1.., 0);
-        // You cannot use bytes_not_processed = bytes_read - last_new_line_index
-        // - 1; because the buffer will contain unprocessed bytes from the
-        // previous iteration and the new line index will be calculated from the
-        // start of the buffer
-        bytes_not_processed = actual_buf.len() - last_new_line_index - 1;
-    }
-    drop(sender);
-
-    // Combine data from all threads
-    let mut result = HashMap::<Box<[u8]>, StationValues>::default();
-    for handle in handles {
-        let map = handle.join().unwrap();
-        for (station_name, station_values) in map.into_iter() {
-            // dbg!(station_values);
-            result
-                .entry(station_name)
-                .and_modify(|e| {
-                    if station_values.min < e.min {
-                        e.min = station_values.min;
-                    }
-                    if station_values.max > e.max {
-                        e.max = station_values.max;
-                    }
-                    e.mean += station_values.mean;
-                    e.count += station_values.count;
-                })
-                .or_insert(station_values);
-        }
-    }
-
-    // Calculate the mean for all entries and round off to 1 decimal place
-    for (_name, station_values) in result.iter_mut() {
-        station_values.mean = round_off(station_values.mean / station_values.count as f64);
-        station_values.min = round_off(station_values.min);
-        station_values.max = round_off(station_values.max);
-    }
-
-    result
-}
-
 fn main() {
-    // let start = Instant::now();
+    let start = Instant::now();
     let args = Args::parse();
 
     let file = std::fs::File::open(&args.file).expect("Failed to open file");
-    let result = calculate_station_values(file);
+    let mmap = unsafe { Mmap::map(&file).expect("Failed to map file") };
+    let data = &*mmap;
+
+    let result = calculate_station_values(data);
     write_result_stdout(result);
+    let duration = start.elapsed();
+    println!("\nTime taken is: {:?}", duration);
 
-    // let duration = start.elapsed();
-    // println!("\nTime taken is: {:?}", duration);
-}
-
-fn find_new_line_pos(bytes: &[u8]) -> Option<usize> {
-    // In this case (position is not far enough),
-    // naive version is faster than bstr (memchr)
-    bytes.iter().rposition(|&b| b == b'\n')
 }
